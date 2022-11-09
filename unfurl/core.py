@@ -15,50 +15,20 @@
 # limitations under the License.
 
 import configparser
+import logging
 import importlib
 import networkx
 import queue
 import re
 import unfurl.parsers
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, redirect, url_for
 from flask_cors import CORS
+from flask_restx import Api, Namespace, Resource
+from pymispwarninglists import WarningLists
 from unfurl import utils
-
-import logging
+from urllib.parse import unquote
 
 log = logging.getLogger(__name__)
-
-# This class and these imports can be removed when they merge https://github.com/MISP/PyMISPWarningLists/pull/15 and
-# put out a new PyPI package.
-from pymispwarninglists import WarningLists
-from pymispwarninglists import api as WarningListsApi
-import json
-import sys
-from glob import glob
-from pathlib import Path
-from typing import Union, Dict, Any, List, Optional
-
-
-class FixedWarningLists(WarningLists):
-    def __init__(self, slow_search: bool = False, lists: Optional[List] = None):
-        """Load all the warning lists from the package.
-        :slow_search: If true, uses the most appropriate search method. Can be slower. Default: exact match.
-        :lists: A list of warning lists (typically fetched from a MISP instance)
-        """
-
-        if not lists:
-            lists = []
-            self.root_dir_warninglists = Path(
-                sys.modules['pymispwarninglists'].__file__).parent / 'data' / 'misp-warninglists' / 'lists'
-            for warninglist_file in glob(str(self.root_dir_warninglists / '*' / 'list.json')):
-                with open(warninglist_file, mode='r', encoding="utf-8") as f:
-                    lists.append(json.load(f))
-        if not lists:
-            raise api.PyMISPWarningListsError(
-                'Unable to load the lists. Do not forget to initialize the submodule (git submodule update --init).')
-        self.warninglists = {}
-        for warninglist in lists:
-            self.warninglists[warninglist['name']] = WarningListsApi.WarningList(warninglist, slow_search)
 
 
 class Unfurl:
@@ -102,12 +72,17 @@ class Unfurl:
                     self.label = f'{self.key}: {self.value}'
                 elif self.value:
                     self.label = self.value
+                elif self.key:
+                    self.label = f'{self.key}:'
 
         def __repr__(self):
             return str(self.__dict__)
 
+        def to_dict(self):
+            return self.__dict__
+
     def build_known_domain_lists(self):
-        warning_lists = FixedWarningLists()
+        warning_lists = WarningLists()
         warning_lists_dict = warning_lists.warninglists
 
         # This list has some values I think may confuse users (t.co, drive.google.com, etc), as most things on
@@ -276,7 +251,7 @@ class Unfurl:
     def check_if_int_between(value, low, high):
         try:
             value = int(value)
-        except:
+        except Exception:
             return False
 
         if low < value < high:
@@ -376,6 +351,15 @@ class Unfurl:
             edge_summary[edge.get('title')] += 1
 
         data_json['summary'] = edge_summary
+
+        return data_json
+
+    def generate_full_json(self):
+        data_json = {'nodes': [], 'edges': []}
+        for orig_node in self.graph.nodes():
+            data_json['nodes'].append(orig_node.to_dict())
+        for orig_edge in self.graph.edges():
+            data_json['edges'].append(orig_edge)
 
         return data_json
 
@@ -533,31 +517,68 @@ class UnfurlApp:
 
 
 @app.route('/')
-def index():
-    return render_template(
-        'graph.html', url_to_unfurl='', unfurl_host=unfurl_app_host,
-        unfurl_port=unfurl_app_port)
+@app.route('/<path:path>')
+def index(path=''):
+    url_to_unfurl = ''
+    if path:
+        # backward compatibility, it is preferable to use the graph route and a quoted URL instead
+        if f':{unfurl_app_port}/' in request.url:
+            url_to_unfurl = unquote(request.url.split(f':{unfurl_app_port}/', 1)[1])
+        else:
+            # for tests, the port isn't in the URL, take everything after the domain
+            url_to_unfurl = unquote(request.url.split('/', 3)[-1])
+        return redirect(url_for('graph', url=url_to_unfurl))
+    return render_template('graph.html',
+                           unfurl_host=unfurl_app_host,
+                           unfurl_port=unfurl_app_port)
 
 
-@app.route('/<path:url_to_unfurl>')
-def graph(url_to_unfurl):
-    return render_template(
-        'graph.html', url_to_unfurl=url_to_unfurl,
-        unfurl_host=unfurl_app_host, unfurl_port=unfurl_app_port)
+@app.route('/graph')
+def graph():
+    if 'url' not in request.args:
+        return redirect(url_for('index'))
+    return render_template('graph.html',
+                           unfurl_host=unfurl_app_host,
+                           unfurl_port=unfurl_app_port)
 
 
-@app.route('/api/<path:api_path>')
-def api(api_path):
-    # Get the referrer from the request, which has the full url + query string.
-    # Split off the local server and keep just the url we want to parse
-    unfurl_this = request.referrer.split(f':{unfurl_app_port}/', 1)[1]
+restx_api = Api(app, title='Unfurl API',
+                description='API to submit URLs to expand to an unfurl instance.',
+                doc='/doc/')
 
-    unfurl_instance = Unfurl(remote_lookups=app.config['remote_lookups'])
-    unfurl_instance.add_to_queue(
-        data_type='url', key=None,
-        extra_options={'widthConstraint': {'maximum': 1200}},
-        value=unfurl_this)
-    unfurl_instance.parse_queue()
+namespace = Namespace('GenericAPI', description='Generic unfurl API', path='/')
 
-    unfurl_json = unfurl_instance.generate_json()
-    return unfurl_json
+restx_api.add_namespace(namespace)
+
+
+@namespace.route('/json/visjs')
+@namespace.doc(description='Expand a URL and returns the JSON expansion in the vis.js format')
+class JsonVisJS(Resource):
+
+    @namespace.param('url', 'The URL to expand', required=False)
+    def get(self):
+        if 'url' not in request.args:
+            return {}
+        unfurl_this = unquote(request.args['url'])
+        return run(
+            unfurl_this,
+            return_type='json',
+            remote_lookups=app.config['remote_lookups'],
+            extra_options={'widthConstraint': {'maximum': 1200}})
+
+
+def run(url, data_type='url', return_type='json', remote_lookups=False, extra_options=None):
+    u = Unfurl(remote_lookups=remote_lookups)
+    u.add_to_queue(
+        data_type=data_type,
+        key=None,
+        value=url,
+        extra_options=extra_options
+    )
+    u.parse_queue()
+    if return_type == 'text':
+        return u.generate_text_tree()
+    elif return_type == 'full_json':
+        return u.generate_full_json()
+    else:
+        return u.generate_json()

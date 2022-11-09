@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2022 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,12 @@
 # limitations under the License.
 
 __author__ = "Ryan Benson"
-__version__ = "2021.06.15"
+__version__ = "2022.11"
 __email__ = "ryan@dfir.blog"
 
 import logging
 import sys
+from unfurl.core import run
 
 log = logging.getLogger(__name__)
 log.setLevel('WARNING')
@@ -27,3 +28,7 @@ formatter = logging.Formatter(
     '%(asctime)s.%(msecs).03d | %(name)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 handler.setFormatter(formatter)
 log.addHandler(handler)
+
+
+def print_tree(url, data_type='url', remote_lookups=False, extra_options=None):
+    print(run(url, data_type=data_type, return_type='text', remote_lookups=remote_lookups, extra_options=extra_options))
